@@ -56,8 +56,15 @@ protocol PaginationViewDelegate: AnyObject {
         pointerDidEndCancelled cancelled: Bool
     )
 
+    /// Prepares destination-surface facts that must be current before a
+    /// cross-page interaction can publish settlement.
+    func paginationView(
+        _ paginationView: PaginationView,
+        prepareViewportInteractionSettlement generation: NavigatorViewportInteractionGeneration
+    ) async -> Bool
+
     /// Called after physical motion and any destination ``PageView/go(to:animated:)``
-    /// work have both completed.
+    /// work and settlement preparation have completed.
     func paginationView(
         _ paginationView: PaginationView,
         viewportInteractionDidSettle generation: NavigatorViewportInteractionGeneration
@@ -338,14 +345,41 @@ final class PaginationView: UIView, Loggable {
         loadPagesTask.replace { @MainActor in
             await loadNextPage(revision: revision)
             guard revision == loadPagesRevision, !Task.isCancelled else { return }
-            delegate?.paginationViewDidUpdateViews(self)
             if
                 let pending = pendingViewportInteractionSettlement,
                 pending.destinationIndex == currentIndex,
                 currentView != nil
             {
-                pendingViewportInteractionSettlement = nil
-                viewportInteractionDidSettle(pending.generation)
+                let didPublish = await publishViewportInteractionSettlementWhenReady(
+                    prepare: {
+                        await delegate?.paginationView(
+                            self,
+                            prepareViewportInteractionSettlement: pending.generation
+                        ) ?? false
+                    },
+                    isStillCurrent: {
+                        guard
+                            revision == loadPagesRevision,
+                            !Task.isCancelled,
+                            let currentPending = pendingViewportInteractionSettlement
+                        else {
+                            return false
+                        }
+                        return currentPending.generation == pending.generation
+                            && currentPending.destinationIndex == pending.destinationIndex
+                            && currentPending.destinationIndex == currentIndex
+                    },
+                    publish: {
+                        delegate?.paginationViewDidUpdateViews(self)
+                        pendingViewportInteractionSettlement = nil
+                        viewportInteractionDidSettle(pending.generation)
+                    }
+                )
+                if !didPublish, revision == loadPagesRevision, !Task.isCancelled {
+                    delegate?.paginationViewDidUpdateViews(self)
+                }
+            } else {
+                delegate?.paginationViewDidUpdateViews(self)
             }
         }
     }

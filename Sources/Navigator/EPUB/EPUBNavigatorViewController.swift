@@ -29,6 +29,10 @@ public typealias EPUBContentInsets = (top: CGFloat, bottom: CGFloat)
 public enum EPUBViewportInteractionError: Error {
     /// The requested render surface is no longer elected.
     case surfaceUnavailable
+
+    /// The requested render surface is current, but no live locator could be
+    /// resolved for it.
+    case locationUnavailable
 }
 
 open class EPUBNavigatorViewController: InputObservableViewController,
@@ -788,6 +792,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
     }
 
+    private func computeLocationAndViewport(
+        for spreadView: EPUBSpreadView
+    ) async -> (Locator?, NavigatorViewport) {
+        await EPUBViewportAndLocationCalculator.compute(
+            readingOrderIndices: spreadView.spread.readingOrderIndices,
+            progression: { spreadView.progression(in: $0) },
+            readingOrder: readingOrder,
+            positionsByReadingOrder: positionsByReadingOrder,
+            tableOfContentsTitleByHref: tableOfContentsTitleByHref,
+            fallbackLocator: { [publication] in await publication.locate($0) }
+        )
+    }
+
     private func computeCurrentLocationAndViewport() async -> (Locator?, NavigatorViewport?) {
         if case .initializing = state {
             assertionFailure("Cannot update current location when initializing the navigator")
@@ -804,15 +821,44 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return (nil, nil)
         }
 
-        let (locator, viewport) = await EPUBViewportAndLocationCalculator.compute(
-            readingOrderIndices: spreadView.spread.readingOrderIndices,
-            progression: { spreadView.progression(in: $0) },
-            readingOrder: readingOrder,
-            positionsByReadingOrder: positionsByReadingOrder,
-            tableOfContentsTitleByHref: tableOfContentsTitleByHref,
-            fallbackLocator: { [publication] in await publication.locate($0) }
-        )
+        let (locator, viewport) = await computeLocationAndViewport(for: spreadView)
         return (locator, viewport)
+    }
+
+    private func liveLocationAndViewport(
+        inSurface surfaceIdentifier: UUID,
+        layoutGeneration: UInt64
+    ) async -> Result<(Locator?, NavigatorViewport), Error> {
+        guard
+            state.pendingLocator == nil,
+            let spreadView = paginationView?.currentView as? EPUBSpreadView
+        else {
+            return .failure(EPUBViewportInteractionError.locationUnavailable)
+        }
+
+        return await evaluateViewportInteractionSurface(
+            requestedSurfaceIdentifier: surfaceIdentifier,
+            requestedLayoutGeneration: layoutGeneration,
+            currentLease: { [weak self] in self?.viewportInteractionSurfaceLease },
+            operation: {
+                await .success(self.computeLocationAndViewport(for: spreadView))
+            }
+        )
+    }
+
+    private func publishCurrentLocationAndViewport(
+        _ result: (location: Locator?, viewport: NavigatorViewport?)
+    ) {
+        (currentLocation, viewport) = result
+
+        if
+            let delegate,
+            let location = currentLocation,
+            location != notifiedCurrentLocation
+        {
+            notifiedCurrentLocation = location
+            delegate.navigator(self, locationDidChange: location)
+        }
     }
 
     public func firstVisibleElementLocator() async -> Locator? {
@@ -835,16 +881,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return
         }
 
-        (currentLocation, viewport) = await computeCurrentLocationAndViewport()
-
-        if
-            let delegate = delegate,
-            let location = currentLocation,
-            location != notifiedCurrentLocation
-        {
-            notifiedCurrentLocation = location
-            delegate.navigator(self, locationDidChange: location)
-        }
+        let initialLease = viewportInteractionSurfaceLease
+        let result = await computeCurrentLocationAndViewport()
+        guard viewportInteractionSurfaceLease == initialLease else { return }
+        publishCurrentLocationAndViewport(result)
     }
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
@@ -1077,6 +1117,35 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             requestedLayoutGeneration: layoutGeneration,
             currentLease: { [weak self] in self?.viewportInteractionSurfaceLease },
             operation: { await spreadView.evaluateScript(script) }
+        )
+    }
+
+    /// Computes a live locator only while the requested viewport surface and
+    /// layout generation remain elected.
+    ///
+    /// Unlike ``currentLocation``, this method never falls back to a cached
+    /// locator from a previously elected spine. Consumers should pair it with
+    /// the surface and generation carried by a viewport-interaction
+    /// fingerprint.
+    public func currentLocation(
+        inViewportInteractionSurface surfaceIdentifier: UUID,
+        layoutGeneration: UInt64
+    ) async -> Result<Locator, Error> {
+        guard
+            state.pendingLocator == nil,
+            let spreadView = paginationView?.currentView as? EPUBSpreadView
+        else {
+            return .failure(EPUBViewportInteractionError.locationUnavailable)
+        }
+
+        return await evaluateViewportInteractionLocation(
+            requestedSurfaceIdentifier: surfaceIdentifier,
+            requestedLayoutGeneration: layoutGeneration,
+            currentLease: { [weak self] in self?.viewportInteractionSurfaceLease },
+            operation: {
+                let (location, _) = await self.computeLocationAndViewport(for: spreadView)
+                return location
+            }
         )
     }
 
@@ -1493,6 +1562,26 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
             owner: viewportInteractionOwner(for: paginationView),
             cancelled: cancelled
         )
+    }
+
+    func paginationView(
+        _ paginationView: PaginationView,
+        prepareViewportInteractionSettlement generation: NavigatorViewportInteractionGeneration
+    ) async -> Bool {
+        guard let fingerprint = viewportInteractionFingerprint else {
+            return false
+        }
+
+        let result = await liveLocationAndViewport(
+            inSurface: fingerprint.surfaceIdentifier,
+            layoutGeneration: fingerprint.layoutGeneration
+        )
+        guard case let .success((location, viewport)) = result else {
+            return false
+        }
+
+        publishCurrentLocationAndViewport((location, viewport))
+        return true
     }
 
     func paginationView(
