@@ -9,6 +9,7 @@ import ReadiumShared
 import UIKit
 
 protocol EPUBNavigatorViewModelDelegate: AnyObject {
+    func epubNavigatorViewModelWillChangeViewportLayout(_ viewModel: EPUBNavigatorViewModel)
     func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, runScript script: String, in scope: EPUBScriptScope)
     func epubNavigatorViewModelInvalidatePaginationView(_ viewModel: EPUBNavigatorViewModel)
     func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, didFailToLoadResourceAt href: RelativeURL, withError error: ReadError)
@@ -229,9 +230,17 @@ enum EPUBScriptScope {
                 || oldSettings.fit != newSettings.fit
                 || oldSettings.offsetFirstPage != newSettings.offsetFirstPage
 
+        let cssChange = updateCSS(with: settings)
+
+        if needsInvalidation || cssChange.didChange {
+            delegate?.epubNavigatorViewModelWillChangeViewportLayout(self)
+        }
+
         // We don't commit the CSS changes if we invalidate the pagination, as
         // the resources will be reloaded anyway.
-        updateCSS(with: settings, commitNow: !needsInvalidation)
+        if !needsInvalidation {
+            commitCSSChange(from: cssChange.previous, to: css)
+        }
 
         if needsInvalidation {
             setNeedsInvalidatePagination()
@@ -280,6 +289,7 @@ enum EPUBScriptScope {
             return
         }
         viewSize = newSize
+        delegate?.epubNavigatorViewModelWillChangeViewportLayout(self)
         updateSpread()
     }
 
@@ -345,9 +355,12 @@ enum EPUBScriptScope {
         }
     }
 
-    private func updateCSS(with settings: EPUBSettings, commitNow: Bool) {
+    private func updateCSS(with settings: EPUBSettings) -> (previous: ReadiumCSS, didChange: Bool) {
         let previous = css
         css.update(with: settings)
+
+        let didChange = previous.rsProperties.cssProperties() != css.rsProperties.cssProperties()
+            || previous.userProperties.cssProperties() != css.userProperties.cssProperties()
 
         // HTML resources in the cache have the CSS already injected at the time
         // they were first served. Evict them so that any future resource load
@@ -356,9 +369,7 @@ enum EPUBScriptScope {
         // are not affected by CSS changes and can remain cached.
         server.clearResourceCache { _, mediaType in mediaType.isHTML }
 
-        if commitNow {
-            commitCSSChange(from: previous, to: css)
-        }
+        return (previous, didChange)
     }
 
     private func commitCSSChange(from previous: ReadiumCSS, to new: ReadiumCSS) {

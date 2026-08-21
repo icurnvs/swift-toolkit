@@ -153,6 +153,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private let viewportInteractionNavigatorIdentifier = UUID()
     private var viewportInteractionLayoutGeneration: UInt64 = 0
 
+    private var viewportInteractionSurfaceLease: EPUBViewportInteractionSurfaceLease? {
+        guard let surfaceIdentifier = viewportInteractionSurfaceIdentifier else {
+            return nil
+        }
+        return EPUBViewportInteractionSurfaceLease(
+            surfaceIdentifier: surfaceIdentifier,
+            layoutGeneration: viewportInteractionLayoutGeneration
+        )
+    }
+
+    private func advanceViewportInteractionLayoutGeneration() {
+        precondition(viewportInteractionLayoutGeneration < .max, "Viewport layout generation exhausted")
+        viewportInteractionLayoutGeneration += 1
+    }
+
     /// Exact live geometry for the elected EPUB render surface.
     public var viewportInteractionFingerprint: NavigatorViewportFingerprint? {
         guard
@@ -652,8 +667,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return
         }
 
-        precondition(viewportInteractionLayoutGeneration < .max, "Viewport layout generation exhausted")
-        viewportInteractionLayoutGeneration += 1
+        advanceViewportInteractionLayoutGeneration()
 
         spreads = EPUBSpread.makeSpreads(
             for: publication,
@@ -1046,21 +1060,24 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Evaluates JavaScript only when the requested render surface is the
     /// currently elected EPUB WebView.
     ///
-    /// Capturing the matching spread before awaiting JavaScript makes a
-    /// successful result provably originate from `surfaceIdentifier`, even if
-    /// pagination elects another surface while the query is in flight.
+    /// The elected surface and layout generation are checked both before and
+    /// after JavaScript evaluation. A result from a surface that lost election
+    /// or reflowed while the query was suspended is discarded.
     @discardableResult
     public func evaluateJavaScript(
         _ script: String,
-        inViewportInteractionSurface surfaceIdentifier: UUID
+        inViewportInteractionSurface surfaceIdentifier: UUID,
+        layoutGeneration: UInt64? = nil
     ) async -> Result<Any, Error> {
-        guard
-            let spreadView = paginationView?.currentView as? EPUBSpreadView,
-            spreadView.viewportInteractionIdentifier == surfaceIdentifier
-        else {
+        guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
             return .failure(EPUBViewportInteractionError.surfaceUnavailable)
         }
-        return await spreadView.evaluateScript(script)
+        return await evaluateViewportInteractionSurface(
+            requestedSurfaceIdentifier: surfaceIdentifier,
+            requestedLayoutGeneration: layoutGeneration,
+            currentLease: { [weak self] in self?.viewportInteractionSurfaceLease },
+            operation: { await spreadView.evaluateScript(script) }
+        )
     }
 
     // MARK: - UIAccessibilityAction
@@ -1091,6 +1108,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 }
 
 extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
+    func epubNavigatorViewModelWillChangeViewportLayout(_ viewModel: EPUBNavigatorViewModel) {
+        advanceViewportInteractionLayoutGeneration()
+    }
+
     func epubNavigatorViewModelInvalidatePaginationView(_ viewModel: EPUBNavigatorViewModel) {
         invalidatePaginationView()
     }
