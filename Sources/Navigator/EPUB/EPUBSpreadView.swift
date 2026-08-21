@@ -29,6 +29,31 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     /// Called when the pages visible in the spread changed.
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView)
 
+    /// Called when a native viewport-moving gesture is recognized.
+    func spreadViewViewportInteractionDidBegin(
+        _ spreadView: EPUBSpreadView
+    ) -> NavigatorViewportInteractionGeneration?
+
+    /// Called when the recognized viewport pointer ends or is cancelled.
+    func spreadView(
+        _ spreadView: EPUBSpreadView,
+        viewportInteraction generation: NavigatorViewportInteractionGeneration,
+        pointerDidEndCancelled cancelled: Bool
+    )
+
+    /// Called when the native viewport reaches an affirmative physical
+    /// terminal after the pointer ended.
+    func spreadView(
+        _ spreadView: EPUBSpreadView,
+        viewportInteractionDidSettle generation: NavigatorViewportInteractionGeneration
+    )
+
+    /// Called when a participating render surface is retired.
+    func spreadView(
+        _ spreadView: EPUBSpreadView,
+        didRetireViewportInteraction generation: NavigatorViewportInteractionGeneration
+    )
+
     /// Called when the spread view needs to present a view controller.
     func spreadView(_ spreadView: EPUBSpreadView, present viewController: UIViewController)
 
@@ -49,6 +74,12 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     private(set) var focusedResource: ReadingOrder.Index?
 
     let webView: WebView
+
+    /// Stable identity used by navigator-level viewport fingerprints.
+    let viewportInteractionIdentifier = UUID()
+    private var viewportInteractionPointerState = ViewportInteractionPointerState()
+    private var viewportInteractionPanObserver: ViewportInteractionPanObserver!
+    private var didRetireViewportInteraction = false
 
     private var lastClick: ClickEvent?
 
@@ -92,6 +123,15 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         addSubview(webView)
         setupWebView()
+        viewportInteractionPanObserver = ViewportInteractionPanObserver(
+            recognizer: scrollView.panGestureRecognizer,
+            onBegan: { [weak self] in
+                self?.viewportInteractionDidBegin()
+            },
+            onCancelled: { [weak self] in
+                self?.viewportInteractionPointerDidEnd(cancelled: true)
+            }
+        )
 
         for script in scripts {
             webView.configuration.userContentController.addUserScript(script)
@@ -112,6 +152,8 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// Called when the spread view is removed from the view hierarchy, to
     /// clear pending operations and retain cycles.
     func clear() {
+        retireViewportInteractionIfNeeded()
+
         webView.stopLoading()
 
         spreadLoadTask?.cancel()
@@ -147,6 +189,71 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     var scrollView: UIScrollView {
         webView.scrollView
+    }
+
+    var viewportInteractionGeometry: NavigatorViewportFingerprint.Geometry {
+        NavigatorViewportFingerprint.Geometry(
+            bounds: scrollView.bounds,
+            contentOffset: scrollView.contentOffset,
+            contentSize: scrollView.contentSize,
+            adjustedContentInset: scrollView.adjustedContentInset,
+            zoomScale: scrollView.zoomScale
+        )
+    }
+
+    private func viewportInteractionDidBegin() {
+        didRetireViewportInteraction = false
+        viewportInteractionPointerState.begin(
+            delegate?.spreadViewViewportInteractionDidBegin(self)
+        )
+    }
+
+    private func viewportInteractionPointerDidEnd(cancelled: Bool) {
+        guard let pointerEnd = viewportInteractionPointerState.didEndPointer(cancelled: cancelled) else {
+            return
+        }
+        delegate?.spreadView(
+            self,
+            viewportInteraction: pointerEnd.generation,
+            pointerDidEndCancelled: pointerEnd.cancelled
+        )
+
+        if pointerEnd.hasBufferedPhysicalTerminal {
+            reportViewportInteractionSettlement(pointerEnd.generation)
+        }
+    }
+
+    func cancelViewportInteractionPointerForSceneDeparture() {
+        viewportInteractionPointerDidEnd(cancelled: true)
+    }
+
+    private func viewportInteractionDidSettle(
+        bufferUntilPointerTerminal: Bool = false
+    ) {
+        guard
+            let generation = viewportInteractionPointerState.didReachPhysicalTerminal(
+                bufferUntilPointerEnd: bufferUntilPointerTerminal
+            )
+        else { return }
+        reportViewportInteractionSettlement(generation)
+    }
+
+    private func reportViewportInteractionSettlement(
+        _ generation: NavigatorViewportInteractionGeneration
+    ) {
+        guard viewportInteractionPointerState.didReportSettlement(generation) else { return }
+        delegate?.spreadView(self, viewportInteractionDidSettle: generation)
+    }
+
+    private func retireViewportInteractionIfNeeded() {
+        guard
+            !didRetireViewportInteraction,
+            let generation = viewportInteractionPointerState.retire()
+        else {
+            return
+        }
+        didRetireViewportInteraction = true
+        delegate?.spreadView(self, didRetireViewportInteraction: generation)
     }
 
     override func willMove(toSuperview newSuperview: UIView?) {
@@ -679,6 +786,27 @@ extension EPUBSpreadView: UIScrollViewDelegate {
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         webView.clearSelection()
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        if !decelerate {
+            // Depending on UIKit's target ordering this delegate callback can
+            // precede the pan recognizer's `.ended` target action. Buffer only
+            // this same-pointer non-decelerating terminal until pointer end.
+            viewportInteractionDidSettle(bufferUntilPointerTerminal: true)
+        }
+    }
+
+    func scrollViewWillEndDragging(
+        _ scrollView: UIScrollView,
+        withVelocity velocity: CGPoint,
+        targetContentOffset: UnsafeMutablePointer<CGPoint>
+    ) {
+        viewportInteractionPointerDidEnd(cancelled: false)
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        viewportInteractionDidSettle()
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {

@@ -43,6 +43,25 @@ protocol PaginationViewDelegate: AnyObject {
 
     /// Returns the number of positions (as in `Publication.positionList`) in the page view at given index.
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int
+
+    /// Called when the outer pagination viewport recognizes a moving gesture.
+    func paginationViewViewportInteractionDidBegin(
+        _ paginationView: PaginationView
+    ) -> NavigatorViewportInteractionGeneration?
+
+    /// Called when the recognized viewport pointer ends or is cancelled.
+    func paginationView(
+        _ paginationView: PaginationView,
+        viewportInteraction generation: NavigatorViewportInteractionGeneration,
+        pointerDidEndCancelled cancelled: Bool
+    )
+
+    /// Called after physical motion and any destination ``PageView/go(to:animated:)``
+    /// work have both completed.
+    func paginationView(
+        _ paginationView: PaginationView,
+        viewportInteractionDidSettle generation: NavigatorViewportInteractionGeneration
+    )
 }
 
 final class PaginationView: UIView, Loggable {
@@ -92,6 +111,14 @@ final class PaginationView: UIView, Loggable {
     }
 
     private let scrollView = UIScrollView()
+    let viewportInteractionIdentifier = UUID()
+    private var viewportInteractionPointerState = ViewportInteractionPointerState()
+    private var pendingViewportInteractionSettlement: (
+        generation: NavigatorViewportInteractionGeneration,
+        destinationIndex: Int
+    )?
+    private var viewportInteractionPanObserver: ViewportInteractionPanObserver!
+    private var loadPagesRevision: UInt64 = 0
 
     /// Set while a transition animation is in progress to prevent
     /// `layoutSubviews` from resetting `contentOffset` and interrupting the
@@ -123,6 +150,15 @@ final class PaginationView: UIView, Loggable {
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.isScrollEnabled = isScrollEnabled
         addSubview(scrollView)
+        viewportInteractionPanObserver = ViewportInteractionPanObserver(
+            recognizer: scrollView.panGestureRecognizer,
+            onBegan: { [weak self] in
+                self?.viewportInteractionDidBegin()
+            },
+            onCancelled: { [weak self] in
+                self?.viewportInteractionPointerDidEnd(cancelled: true)
+            }
+        )
 
         // Adds an empty view before the scroll view to have a consistent behavior on all iOS
         // versions, regarding to the content inset adjustements. Even if
@@ -132,6 +168,60 @@ final class PaginationView: UIView, Loggable {
         insertSubview(UIView(frame: .zero), at: 0)
         // Prevents the content from jumping down when the status bar is toggled
         scrollView.contentInsetAdjustmentBehavior = .never
+    }
+
+    var viewportInteractionGeometry: NavigatorViewportFingerprint.Geometry {
+        NavigatorViewportFingerprint.Geometry(
+            bounds: scrollView.bounds,
+            contentOffset: scrollView.contentOffset,
+            contentSize: scrollView.contentSize,
+            adjustedContentInset: scrollView.adjustedContentInset,
+            zoomScale: scrollView.zoomScale
+        )
+    }
+
+    private func viewportInteractionDidBegin() {
+        pendingViewportInteractionSettlement = nil
+        viewportInteractionPointerState.begin(
+            delegate?.paginationViewViewportInteractionDidBegin(self)
+        )
+    }
+
+    private func viewportInteractionPointerDidEnd(cancelled: Bool) {
+        guard let pointerEnd = viewportInteractionPointerState.didEndPointer(cancelled: cancelled) else {
+            return
+        }
+        delegate?.paginationView(
+            self,
+            viewportInteraction: pointerEnd.generation,
+            pointerDidEndCancelled: pointerEnd.cancelled
+        )
+
+        if pointerEnd.hasBufferedPhysicalTerminal {
+            viewportInteractionDidSettle(pointerEnd.generation)
+        }
+    }
+
+    func cancelViewportInteractionPointerForSceneDeparture() {
+        viewportInteractionPointerDidEnd(cancelled: true)
+    }
+
+    private func viewportInteractionDidReachPhysicalTerminal(
+        bufferUntilPointerEnd: Bool = false
+    ) -> NavigatorViewportInteractionGeneration? {
+        viewportInteractionPointerState.didReachPhysicalTerminal(
+            bufferUntilPointerEnd: bufferUntilPointerEnd
+        )
+    }
+
+    private func viewportInteractionDidSettle(
+        _ generation: NavigatorViewportInteractionGeneration
+    ) {
+        guard viewportInteractionPointerState.didReportSettlement(generation) else { return }
+        if pendingViewportInteractionSettlement?.generation == generation {
+            pendingViewportInteractionSettlement = nil
+        }
+        delegate?.paginationView(self, viewportInteractionDidSettle: generation)
     }
 
     @available(*, unavailable)
@@ -242,15 +332,28 @@ final class PaginationView: UIView, Loggable {
     }
 
     private func loadPages() {
+        precondition(loadPagesRevision < .max, "Pagination load revision exhausted")
+        loadPagesRevision += 1
+        let revision = loadPagesRevision
         loadPagesTask.replace { @MainActor in
-            await loadNextPage()
+            await loadNextPage(revision: revision)
+            guard revision == loadPagesRevision, !Task.isCancelled else { return }
             delegate?.paginationViewDidUpdateViews(self)
+            if
+                let pending = pendingViewportInteractionSettlement,
+                pending.destinationIndex == currentIndex,
+                currentView != nil
+            {
+                pendingViewportInteractionSettlement = nil
+                viewportInteractionDidSettle(pending.generation)
+            }
         }
     }
 
     private var loadPagesTask: Task<Void, Never>?
 
-    private func loadNextPage() async {
+    private func loadNextPage(revision: UInt64) async {
+        guard revision == loadPagesRevision, !Task.isCancelled else { return }
         guard let (index, location) = loadingIndexQueue.popFirst() else {
             return
         }
@@ -269,7 +372,8 @@ final class PaginationView: UIView, Loggable {
         }
 
         await view.go(to: location, animated: false)
-        await loadNextPage()
+        guard revision == loadPagesRevision, !Task.isCancelled else { return }
+        await loadNextPage(revision: revision)
     }
 
     /// Queue views to be loaded until reaching the given number of pre-loaded positions.
@@ -446,7 +550,14 @@ extension PaginationView: UIScrollViewDelegate {
     // Note: using this approach might provide a better experience:
     // https://oleb.net/blog/2014/05/scrollviews-inside-scrollviews/
 
-    func scrollViewWillEndDragging(_ scrollView: UIScrollView, withVelocity velocity: CGPoint, targetContentOffset: UnsafeMutablePointer<CGPoint>) {
+    func scrollViewWillEndDragging(
+        _ scrollView: UIScrollView,
+        withVelocity velocity: CGPoint,
+        targetContentOffset: UnsafeMutablePointer<CGPoint>
+    ) {
+        // Record the real pointer-up before disabling scrolling. Disabling can
+        // make UIKit later report the recognizer as cancelled.
+        viewportInteractionPointerDidEnd(cancelled: false)
         scrollView.isScrollEnabled = false
     }
 
@@ -457,6 +568,13 @@ extension PaginationView: UIScrollViewDelegate {
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
         if !decelerate {
             scrollView.isScrollEnabled = isScrollEnabled
+            if
+                let generation = viewportInteractionDidReachPhysicalTerminal(
+                    bufferUntilPointerEnd: true
+                )
+            {
+                viewportInteractionDidSettle(generation)
+            }
         }
     }
 
@@ -473,6 +591,19 @@ extension PaginationView: UIScrollViewDelegate {
             : scrollView.contentOffset.x
 
         let newIndex = Int(round(currentOffset / scrollView.frame.width))
-        setCurrentIndex(newIndex)
+        guard let generation = viewportInteractionDidReachPhysicalTerminal() else {
+            setCurrentIndex(newIndex)
+            return
+        }
+
+        if newIndex == currentIndex {
+            viewportInteractionDidSettle(generation)
+        } else {
+            // `setCurrentIndex` starts asynchronous page loading and invokes
+            // `PageView.go(to:animated:)`. The interaction is not settled until
+            // that destination surface is ready.
+            pendingViewportInteractionSettlement = (generation, newIndex)
+            setCurrentIndex(newIndex)
+        }
     }
 }

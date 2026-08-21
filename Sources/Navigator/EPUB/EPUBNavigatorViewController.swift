@@ -12,7 +12,7 @@ import UIKit
 import WebKit
 
 @MainActor public protocol EPUBNavigatorDelegate: VisualNavigatorDelegate, SelectableNavigatorDelegate,
-    ViewportObservingNavigatorDelegate
+    ViewportObservingNavigatorDelegate, ViewportInteractionObservingNavigatorDelegate
 {
     // MARK: - WebView Customization
 
@@ -25,8 +25,14 @@ public extension EPUBNavigatorDelegate {
 
 public typealias EPUBContentInsets = (top: CGFloat, bottom: CGFloat)
 
+/// Errors specific to surface-correlated EPUB viewport interaction queries.
+public enum EPUBViewportInteractionError: Error {
+    /// The requested render surface is no longer elected.
+    case surfaceUnavailable
+}
+
 open class EPUBNavigatorViewController: InputObservableViewController,
-    VisualNavigator, ViewportObservingNavigator, SelectableNavigator,
+    VisualNavigator, ViewportObservingNavigator, ViewportInteractionObservingNavigator, SelectableNavigator,
     DecorableNavigator, Configurable, Loggable
 {
     public enum EPUBError: Error {
@@ -143,6 +149,38 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
         }
     }
+
+    private let viewportInteractionNavigatorIdentifier = UUID()
+    private var viewportInteractionLayoutGeneration: UInt64 = 0
+
+    /// Exact live geometry for the elected EPUB render surface.
+    public var viewportInteractionFingerprint: NavigatorViewportFingerprint? {
+        guard
+            let fingerprint = makeViewportInteractionFingerprint(requireReadySurface: true),
+            fingerprint.hasFiniteGeometry
+        else {
+            return nil
+        }
+        return fingerprint
+    }
+
+    /// Stable identity of the currently elected EPUB WebView surface.
+    ///
+    /// This is a convenience lookup for correlating asynchronous content
+    /// queries with ``viewportInteractionFingerprint`` lifecycle snapshots.
+    public var viewportInteractionSurfaceIdentifier: UUID? {
+        (paginationView?.currentView as? EPUBSpreadView)?.viewportInteractionIdentifier
+    }
+
+    private lazy var viewportInteractionTracker = EPUBViewportInteractionTracker(
+        currentSettlement: { [weak self] in
+            self?.currentViewportInteractionSettlement ?? .unavailable(.navigatorNotReady)
+        },
+        onEvent: { [weak self] event in
+            guard let self else { return }
+            self.delegate?.navigator(self, didReceive: event)
+        }
+    )
 
     @available(*, deprecated, renamed: "NavigatorViewport")
     public typealias Viewport = NavigatorViewport
@@ -395,6 +433,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     @objc private func willResignActive() {
         isActive = false
+        viewportInteractionTracker.didCancelActivePointersForSceneDeparture()
+        paginationView?.cancelViewportInteractionPointerForSceneDeparture()
+        if let paginationView {
+            for case let spreadView as EPUBSpreadView in paginationView.loadedViews.values {
+                spreadView.cancelViewportInteractionPointerForSceneDeparture()
+            }
+        }
     }
 
     @objc private func didBecomeActive() {
@@ -607,6 +652,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return
         }
 
+        precondition(viewportInteractionLayoutGeneration < .max, "Viewport layout generation exhausted")
+        viewportInteractionLayoutGeneration += 1
+
         spreads = EPUBSpread.makeSpreads(
             for: publication,
             readingOrder: readingOrder,
@@ -654,6 +702,66 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private var isPaginationViewScrollingEnabled: Bool {
         !(config.disablePageTurnsWhileScrolling && settings.scroll)
+    }
+
+    private func makeViewportInteractionFingerprint(
+        requireReadySurface: Bool
+    ) -> NavigatorViewportFingerprint? {
+        guard
+            let paginationView,
+            let spreadView = paginationView.currentView as? EPUBSpreadView,
+            !requireReadySurface || spreadView.isSpreadLoaded
+        else {
+            return nil
+        }
+
+        return NavigatorViewportFingerprint(
+            navigatorIdentifier: viewportInteractionNavigatorIdentifier,
+            layoutGeneration: viewportInteractionLayoutGeneration,
+            layout: settings.scroll ? .scrolled : .paginated,
+            pageIndex: currentSpreadIndex,
+            surfaceIdentifier: spreadView.viewportInteractionIdentifier,
+            canonicalHREF: spreadView.spread.first.link.url(),
+            viewportFrame: spreadView.convert(spreadView.bounds, to: view),
+            paginationGeometry: paginationView.viewportInteractionGeometry,
+            contentGeometry: spreadView.viewportInteractionGeometry
+        )
+    }
+
+    private var currentViewportInteractionSettlement: NavigatorViewportInteractionSettlement {
+        guard let paginationView else {
+            return .unavailable(.navigatorNotReady)
+        }
+        guard
+            let spreadView = paginationView.currentView as? EPUBSpreadView,
+            spreadView.isSpreadLoaded
+        else {
+            return .unavailable(.surfaceNotReady)
+        }
+        guard let fingerprint = makeViewportInteractionFingerprint(requireReadySurface: false) else {
+            return .unavailable(.surfaceNotReady)
+        }
+        guard fingerprint.hasFiniteGeometry else {
+            return .unavailable(.invalidGeometry)
+        }
+        return .available(fingerprint)
+    }
+
+    private var currentViewportInteractionInitialFingerprint: NavigatorViewportInteractionInitialFingerprint {
+        switch currentViewportInteractionSettlement {
+        case let .available(fingerprint):
+            return .available(fingerprint)
+        case let .unavailable(reason):
+            return .unavailable(reason)
+        }
+    }
+
+    private func viewportInteractionOwner(for spreadView: EPUBSpreadView) -> EPUBViewportInteractionTracker.Owner {
+        .init(kind: .spread, identifier: spreadView.viewportInteractionIdentifier)
+    }
+
+    private func viewportInteractionOwner(for paginationView: PaginationView) -> EPUBViewportInteractionTracker.Owner {
+        .init(kind: .pagination, identifier: paginationView.viewportInteractionIdentifier)
     }
 
     public var presentation: VisualNavigatorPresentation {
@@ -931,6 +1039,26 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     public func evaluateJavaScript(_ script: String) async -> Result<Any, Error> {
         guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
             return .failure(EPUBError.spreadNotLoaded)
+        }
+        return await spreadView.evaluateScript(script)
+    }
+
+    /// Evaluates JavaScript only when the requested render surface is the
+    /// currently elected EPUB WebView.
+    ///
+    /// Capturing the matching spread before awaiting JavaScript makes a
+    /// successful result provably originate from `surfaceIdentifier`, even if
+    /// pagination elects another surface while the query is in flight.
+    @discardableResult
+    public func evaluateJavaScript(
+        _ script: String,
+        inViewportInteractionSurface surfaceIdentifier: UUID
+    ) async -> Result<Any, Error> {
+        guard
+            let spreadView = paginationView?.currentView as? EPUBSpreadView,
+            spreadView.viewportInteractionIdentifier == surfaceIdentifier
+        else {
+            return .failure(EPUBViewportInteractionError.surfaceUnavailable)
         }
         return await spreadView.evaluateScript(script)
     }
@@ -1232,6 +1360,47 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         }
     }
 
+    func spreadViewViewportInteractionDidBegin(
+        _ spreadView: EPUBSpreadView
+    ) -> NavigatorViewportInteractionGeneration? {
+        viewportInteractionTracker.didRecognize(
+            owner: viewportInteractionOwner(for: spreadView),
+            initialFingerprint: currentViewportInteractionInitialFingerprint
+        )
+    }
+
+    func spreadView(
+        _ spreadView: EPUBSpreadView,
+        viewportInteraction generation: NavigatorViewportInteractionGeneration,
+        pointerDidEndCancelled cancelled: Bool
+    ) {
+        viewportInteractionTracker.didEndPointer(
+            generation: generation,
+            owner: viewportInteractionOwner(for: spreadView),
+            cancelled: cancelled
+        )
+    }
+
+    func spreadView(
+        _ spreadView: EPUBSpreadView,
+        viewportInteractionDidSettle generation: NavigatorViewportInteractionGeneration
+    ) {
+        viewportInteractionTracker.didSettle(
+            generation: generation,
+            owner: viewportInteractionOwner(for: spreadView)
+        )
+    }
+
+    func spreadView(
+        _ spreadView: EPUBSpreadView,
+        didRetireViewportInteraction generation: NavigatorViewportInteractionGeneration
+    ) {
+        viewportInteractionTracker.didRetire(
+            generation: generation,
+            owner: viewportInteractionOwner(for: spreadView)
+        )
+    }
+
     func spreadView(_ spreadView: EPUBSpreadView, present viewController: UIViewController) {
         present(viewController, animated: true)
     }
@@ -1282,5 +1451,36 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
 
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int {
         spreads[index].positionCount(in: readingOrder, positionsByReadingOrder: positionsByReadingOrder)
+    }
+
+    func paginationViewViewportInteractionDidBegin(
+        _ paginationView: PaginationView
+    ) -> NavigatorViewportInteractionGeneration? {
+        viewportInteractionTracker.didRecognize(
+            owner: viewportInteractionOwner(for: paginationView),
+            initialFingerprint: currentViewportInteractionInitialFingerprint
+        )
+    }
+
+    func paginationView(
+        _ paginationView: PaginationView,
+        viewportInteraction generation: NavigatorViewportInteractionGeneration,
+        pointerDidEndCancelled cancelled: Bool
+    ) {
+        viewportInteractionTracker.didEndPointer(
+            generation: generation,
+            owner: viewportInteractionOwner(for: paginationView),
+            cancelled: cancelled
+        )
+    }
+
+    func paginationView(
+        _ paginationView: PaginationView,
+        viewportInteractionDidSettle generation: NavigatorViewportInteractionGeneration
+    ) {
+        viewportInteractionTracker.didSettle(
+            generation: generation,
+            owner: viewportInteractionOwner(for: paginationView)
+        )
     }
 }
