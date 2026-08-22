@@ -31,7 +31,9 @@ enum PageLocation: Equatable {
 
 protocol PageView {
     /// Moves the page to the given internal location.
-    func go(to location: PageLocation, animated: Bool) async
+    ///
+    /// - Returns: Whether the requested internal location was resolved.
+    func go(to location: PageLocation, animated: Bool) async -> Bool
 }
 
 protocol PaginationViewDelegate: AnyObject {
@@ -307,9 +309,19 @@ final class PaginationView: UIView, Loggable {
     }
 
     /// Updates the current and pre-loaded views.
-    private func setCurrentIndex(_ index: Int, location: PageLocation? = nil) {
+    private func setCurrentIndex(
+        _ index: Int,
+        location: PageLocation? = nil,
+        loadPagesImmediately: Bool = true
+    ) {
         guard isEmpty || index != currentIndex else {
             return
+        }
+
+        if !loadPagesImmediately {
+            loadPagesTask.cancel()
+            precondition(loadPagesRevision < .max, "Pagination load revision exhausted")
+            loadPagesRevision += 1
         }
 
         // If no explicit location is given, we'll load either the beginning or the end of the
@@ -335,7 +347,9 @@ final class PaginationView: UIView, Loggable {
             }
         }
 
-        loadPages()
+        if loadPagesImmediately {
+            loadPages()
+        }
     }
 
     private func loadPages() {
@@ -392,6 +406,23 @@ final class PaginationView: UIView, Loggable {
             return
         }
 
+        _ = await loadPage(at: index, location: location, animated: false)
+        guard revision == loadPagesRevision, !Task.isCancelled else { return }
+        await loadNextPage(revision: revision)
+    }
+
+    /// Loads a page if needed and resolves the requested internal location.
+    ///
+    /// Programmatic cross-page navigation calls this directly so it can await
+    /// the destination's DOM result instead of reporting success when loading
+    /// merely started.
+    private func loadPage(
+        at index: Int,
+        location: PageLocation,
+        animated: Bool
+    ) async -> Bool {
+        loadingIndexQueue.removeAll { $0.index == index }
+
         if
             loadedViews[index] == nil,
             let view = delegate?.paginationView(self, pageViewAtIndex: index)
@@ -402,12 +433,9 @@ final class PaginationView: UIView, Loggable {
         }
 
         guard let view = loadedViews[index] else {
-            return
+            return false
         }
-
-        await view.go(to: location, animated: false)
-        guard revision == loadPagesRevision, !Task.isCancelled else { return }
-        await loadNextPage(revision: revision)
+        return await view.go(to: location, animated: animated)
     }
 
     /// Queue views to be loaded until reaching the given number of pre-loaded positions.
@@ -461,7 +489,7 @@ final class PaginationView: UIView, Loggable {
     /// - Parameters:
     ///   - index: The index to move to.
     ///   - location: The location to move the future current page view to.
-    /// - Returns: Whether the move is possible.
+    /// - Returns: Whether the destination page resolved the requested internal location.
     func goToIndex(_ index: Int, location: PageLocation, options: NavigatorGoOptions) async -> Bool {
         guard 0 ..< pageCount ~= index else {
             return false
@@ -470,16 +498,15 @@ final class PaginationView: UIView, Loggable {
         let shouldAnimate = options.animated && !UIAccessibility.isReduceMotionEnabled
 
         if currentIndex == index {
-            await scrollToView(at: index, location: location, animated: shouldAnimate)
+            return await scrollToView(at: index, location: location, animated: shouldAnimate)
         } else if abs(currentIndex - index) == 1 {
-            await slideToView(at: index, location: location, animated: shouldAnimate)
+            return await slideToView(at: index, location: location, animated: shouldAnimate)
         } else {
-            await fadeToView(at: index, location: location, animated: shouldAnimate)
+            return await fadeToView(at: index, location: location, animated: shouldAnimate)
         }
-        return true
     }
 
-    private func slideToView(at index: Int, location: PageLocation, animated: Bool) async {
+    private func slideToView(at index: Int, location: PageLocation, animated: Bool) async -> Bool {
         let fromOffset = scrollView.contentOffset
         let targetOffset = CGPoint(x: xOffsetForIndex(index), y: fromOffset.y)
         let translationX = fromOffset.x - targetOffset.x
@@ -507,9 +534,20 @@ final class PaginationView: UIView, Loggable {
             scrollView.isScrollEnabled = isScrollEnabled
         }
 
-        setCurrentIndex(index, location: location)
+        setCurrentIndex(index, location: location, loadPagesImmediately: false)
+        let loadRevision = loadPagesRevision
 
         scrollView.contentOffset = fromOffset
+
+        let resolved = await loadPage(at: index, location: location, animated: false)
+        guard
+            loadRevision == loadPagesRevision,
+            currentIndex == index,
+            !Task.isCancelled
+        else {
+            return false
+        }
+        loadPages()
 
         if animated {
             await animate(duration: 0.3) {
@@ -526,9 +564,10 @@ final class PaginationView: UIView, Loggable {
         if !animated {
             try? await Task.sleep(seconds: 0.1)
         }
+        return resolved
     }
 
-    private func fadeToView(at index: Int, location: PageLocation, animated: Bool) async {
+    private func fadeToView(at index: Int, location: PageLocation, animated: Bool) async -> Bool {
         func fade(to alpha: CGFloat) async {
             await animate(duration: animated ? 0.15 : 0) {
                 self.alpha = alpha
@@ -536,20 +575,30 @@ final class PaginationView: UIView, Loggable {
         }
 
         await fade(to: 0)
-        await scrollToView(at: index, location: location, animated: false)
+        let resolved = await scrollToView(at: index, location: location, animated: false)
         await fade(to: 1)
+        return resolved
     }
 
-    private func scrollToView(at index: Int, location: PageLocation, animated: Bool) async {
+    private func scrollToView(at index: Int, location: PageLocation, animated: Bool) async -> Bool {
         guard currentIndex != index else {
-            if let view = currentView {
-                await view.go(to: location, animated: animated)
-            }
-            return
+            guard let view = currentView else { return false }
+            return await view.go(to: location, animated: animated)
         }
 
         scrollView.isScrollEnabled = isScrollEnabled
-        setCurrentIndex(index, location: location)
+        setCurrentIndex(index, location: location, loadPagesImmediately: false)
+        let loadRevision = loadPagesRevision
+
+        let resolved = await loadPage(at: index, location: location, animated: false)
+        guard
+            loadRevision == loadPagesRevision,
+            currentIndex == index,
+            !Task.isCancelled
+        else {
+            return false
+        }
+        loadPages()
 
         scrollView.scrollRectToVisible(CGRect(
             origin: CGPoint(
@@ -558,6 +607,7 @@ final class PaginationView: UIView, Loggable {
             ),
             size: scrollView.frame.size
         ), animated: animated)
+        return resolved
     }
 
     private func animate(duration: TimeInterval, animations: @escaping () -> Void) async {

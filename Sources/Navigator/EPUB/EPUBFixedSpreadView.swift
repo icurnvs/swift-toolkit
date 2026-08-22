@@ -114,7 +114,15 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
 
     override func spreadDidLoad() async {
         for continuation in goToContinuations {
-            continuation.resume()
+            continuation.resume(returning: true)
+        }
+        goToContinuations.removeAll()
+    }
+
+    override func clear() {
+        super.clear()
+        for continuation in goToContinuations {
+            continuation.resume(returning: false)
         }
         goToContinuations.removeAll()
     }
@@ -154,16 +162,16 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
 
     // MARK: - Location and progression
 
-    private var goToContinuations: [CheckedContinuation<Void, Never>] = []
+    private var goToContinuations: [CheckedContinuation<Bool, Never>] = []
 
-    override func go(to location: PageLocation, animated: Bool) async {
+    override func go(to location: PageLocation, animated: Bool) async -> Bool {
         // Fixed layout resources are always fully visible so we don't use the
         // location.
 
         if isSpreadLoaded {
-            return
+            return true
         } else {
-            await withCheckedContinuation { continuation in
+            return await withCheckedContinuation { continuation in
                 goToContinuations.append(continuation)
             }
         }

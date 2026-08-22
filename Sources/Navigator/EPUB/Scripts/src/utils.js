@@ -183,7 +183,7 @@ export function scrollToPosition(position, dir, animated) {
     console.error(
       `Expected a valid progression in scrollToPosition, got ${position}`
     );
-    return;
+    return false;
   }
 
   if (isScrollModeEnabled()) {
@@ -200,6 +200,7 @@ export function scrollToPosition(position, dir, animated) {
     let offset = documentWidth * position * factor;
     scrollTo({ left: snapOffset(offset), animated });
   }
+  return true;
 }
 
 // Scrolls to the first occurrence of the given text snippet.

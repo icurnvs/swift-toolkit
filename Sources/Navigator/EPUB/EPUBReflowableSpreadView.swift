@@ -38,7 +38,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
         // Clean up go to continuations.
         for continuation in goToContinuations {
-            continuation.resume()
+            continuation.resume(returning: false)
         }
         goToContinuations.removeAll()
 
@@ -157,7 +157,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         try? await Task.sleep(seconds: 0.2)
 
         let location = pendingLocation
-        await go(to: location.location, animated: location.animated)
+        _ = await go(to: location.location, animated: location.animated)
 
         // The rendering is sometimes very slow. So in case we don't show the first page of the resource, we add
         // a generous delay before showing the spread again.
@@ -226,16 +226,15 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// Location to scroll to in the resource once the page is loaded.
     private var pendingLocation: PendingLocation = .init(location: .start, animated: false)
 
-    override func go(to location: PageLocation, animated: Bool) async {
+    override func go(to location: PageLocation, animated: Bool) async -> Bool {
         guard isSpreadLoaded else {
             // Delays moving to the location until the document is loaded.
             pendingLocation = PendingLocation(location: location, animated: animated)
 
-            await waitGoToCompletion()
-            return
+            return await waitGoToCompletion()
         }
 
-        switch location {
+        let resolved = await switch location {
         case let .locator(locator):
             await go(to: locator, animated: animated)
         case .start:
@@ -244,23 +243,24 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             await scroll(toProgression: 1, animated: animated)
         }
 
-        didCompleteGoTo()
+        didCompleteGoTo(resolved)
+        return resolved
     }
 
-    private func waitGoToCompletion() async {
+    private func waitGoToCompletion() async -> Bool {
         await withCheckedContinuation { continuation in
             goToContinuations.append(continuation)
         }
     }
 
-    private func didCompleteGoTo() {
+    private func didCompleteGoTo(_ resolved: Bool) {
         for cont in goToContinuations {
-            cont.resume()
+            cont.resume(returning: resolved)
         }
         goToContinuations.removeAll()
     }
 
-    private var goToContinuations: [CheckedContinuation<Void, Never>] = []
+    private var goToContinuations: [CheckedContinuation<Bool, Never>] = []
 
     private var pendingScrollAnimation: ScrollAnimationRequest?
 
@@ -301,15 +301,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             }
         }
 
-        if locator.text.highlight != nil {
-            return await scroll(toLocator: locator, animated: animated)
+        return await resolveEPUBReflowableLocation(
+            locator,
+            scrollToLocator: { await self.scroll(toLocator: $0, animated: animated) },
             // TODO: find the first fragment matching a tag ID (need a regex)
-        } else if let id = locator.locations.fragments.first, !id.isEmpty {
-            return await scroll(toTagID: id, animated: animated)
-        } else {
-            let progression = locator.locations.progression ?? 0
-            return await scroll(toProgression: progression, animated: animated)
-        }
+            scrollToTagID: { await self.scroll(toTagID: $0, animated: animated) },
+            scrollToProgression: { await self.scroll(toProgression: $0, animated: animated) }
+        )
     }
 
     /// Scrolls at given progression (from 0.0 to 1.0)
@@ -330,8 +328,11 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return true
         } else {
             let dir = viewModel.readingProgression.rawValue
-            await evaluateScript("readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))")
-            return true
+            let result = await evaluateScript("readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))")
+            if case let .failure(error) = result {
+                log(.error, error)
+            }
+            return Self.didResolveNavigation(result)
         }
     }
 
@@ -339,13 +340,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     @discardableResult
     private func scroll(toTagID tagID: String, animated: Bool) async -> Bool {
         let result = await evaluateScript("readium.scrollToId(\'\(tagID)\', \(animated));")
-        switch result {
-        case let .success(value):
-            return (value as? Bool) ?? false
-        case let .failure(error):
+        if case let .failure(error) = result {
             log(.error, error)
-            return false
         }
+        return Self.didResolveNavigation(result)
     }
 
     /// Scrolls at the snippet matching the given text context.
@@ -355,13 +353,18 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return false
         }
         let result = await evaluateScript("readium.scrollToLocator(\(json), \(animated));")
-        switch result {
-        case let .success(value):
-            return (value as? Bool) ?? false
-        case let .failure(error):
+        if case let .failure(error) = result {
             log(.error, error)
-            return false
         }
+        return Self.didResolveNavigation(result)
+    }
+
+    /// Returns whether the JavaScript navigation operation affirmatively
+    /// resolved its target. A successful script evaluation without a Boolean
+    /// result is not sufficient evidence that the requested location exists.
+    static func didResolveNavigation(_ result: Result<Any, Error>) -> Bool {
+        guard case let .success(value) = result else { return false }
+        return (value as? Bool) ?? false
     }
 
     // MARK: - Progression
@@ -435,5 +438,25 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     override func scrollViewDidScroll(_ scrollView: UIScrollView) {
         super.scrollViewDidScroll(scrollView)
         setNeedsNotifyPagesDidChange()
+    }
+}
+
+/// Resolves a locator to the most precise reflowable navigation operation.
+///
+/// Kept separate from the WebView so the success contract can be exercised
+/// deterministically without treating script dispatch as destination proof.
+@MainActor
+func resolveEPUBReflowableLocation(
+    _ locator: Locator,
+    scrollToLocator: (Locator) async -> Bool,
+    scrollToTagID: (String) async -> Bool,
+    scrollToProgression: (Double) async -> Bool
+) async -> Bool {
+    if locator.text.highlight != nil {
+        return await scrollToLocator(locator)
+    } else if let id = locator.locations.fragments.first, !id.isEmpty {
+        return await scrollToTagID(id)
+    } else {
+        return await scrollToProgression(locator.locations.progression ?? 0)
     }
 }
