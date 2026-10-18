@@ -17,7 +17,7 @@ set -e # Exit immediately if any command exits with a non-zero status.
 # 1. Configuration
 # -----------------------------------------------------------------------------
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
 echo "📂  Working directory set to: $(pwd)"
@@ -206,5 +206,5 @@ if [ "$SERVE_SITE" = true ]; then
     # Serve from OUTPUT_ROOT so the subdirectory /swift-toolkit/ exists.
     python3 -m http.server -d "$OUTPUT_ROOT" 8080
 else
-    echo "    Run 'BuildTools/Scripts/generate-docs.sh --serve' to preview."
+    echo "    Run 'scripts/generate-docs.sh --serve' to preview."
 fi

@@ -80,8 +80,10 @@ extension License: LCPLicense {
         do {
             return try await licenses.userRights(for: license.id).copy
         } catch {
+            // If the rights cannot be read (e.g. repository failure), we
+            // restrict the right rather than granting unlimited copy.
             log(.error, error)
-            return nil
+            return 0
         }
     }
 
@@ -125,8 +127,10 @@ extension License: LCPLicense {
         do {
             return try await licenses.userRights(for: license.id).print
         } catch {
+            // If the rights cannot be read (e.g. repository failure), we
+            // restrict the right rather than granting unlimited printing.
             log(.error, error)
-            return nil
+            return 0
         }
     }
 
@@ -237,7 +241,9 @@ extension License: LCPLicense {
             }
 
             func makeRenewURL(from endDate: Date?) throws -> HTTPURL {
-                var params = device.asQueryParameters
+                guard var params = device.asQueryParameters else {
+                    throw LCPError.licenseInteractionNotAvailable
+                }
                 if let end = endDate {
                     params["end"] = end.iso8601
                 }
@@ -285,10 +291,11 @@ extension License: LCPLicense {
     func returnPublication() async -> Result<Void, LCPError> {
         guard
             let status = documents.status,
+            let parameters = device.asQueryParameters,
             let url = try? status.url(
                 for: .return,
                 preferredType: .lcpStatusDocument,
-                parameters: device.asQueryParameters
+                parameters: parameters
             )
         else {
             return .failure(.licenseInteractionNotAvailable)
