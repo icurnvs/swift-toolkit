@@ -19,6 +19,7 @@ import UIKit
 /// when presenting a dialog, for example.
 public final class LCPService: Loggable {
     private let licenses: LicensesService
+    private let passphrases: PassphrasesService
     private let assetRetriever: AssetRetriever
 
     /// - Parameters:
@@ -45,23 +46,23 @@ public final class LCPService: Loggable {
         deviceName: String? = nil,
         deviceId: String? = nil
     ) {
-        // Determine whether the embedded liblcp.a is in production mode, by attempting to open a production license.
-        let isProduction: Bool = {
-            guard
-                let prodLicenseURL = Bundle.module.url(forResource: "prod-license", withExtension: "lcpl"),
-                let prodLicense = try? String(contentsOf: prodLicenseURL, encoding: .utf8)
-            else {
-                return false
-            }
-            let passphrase = "7B7602FEF5DEDA10F768818FFACBC60B173DB223B7E66D8B2221EBE2C635EFAD" // "One passphrase"
-            return client.findOneValidPassphrase(jsonLicense: prodLicense, hashedPassphrases: [passphrase]) == passphrase
-        }()
+        let passphrases = PassphrasesService(
+            client: client,
+            repository: passphraseRepository
+        )
+
+        let crl = CRLService(httpClient: httpClient)
+
+        // Warms the CRL cache so that opening a publication does not have to
+        // wait on the network.
+        Task(priority: .utility) {
+            await crl.preload()
+        }
 
         licenses = LicensesService(
-            isProduction: isProduction,
             client: client,
             licenses: licenseRepository,
-            crl: CRLService(httpClient: httpClient),
+            crl: crl,
             device: DeviceService(
                 deviceName: deviceName ?? UIDevice.current.name,
                 deviceId: deviceId,
@@ -70,13 +71,37 @@ public final class LCPService: Loggable {
             ),
             assetRetriever: assetRetriever,
             httpClient: httpClient,
-            passphrases: PassphrasesService(
-                client: client,
-                repository: passphraseRepository
-            )
+            passphrases: passphrases
         )
 
+        self.passphrases = passphrases
         self.assetRetriever = assetRetriever
+    }
+
+    /// Stores an LCP passphrase candidate in the repository, without
+    /// associating it with a specific license. Useful to preload a passphrase
+    /// ahead of time.
+    ///
+    /// - Parameters:
+    ///   - passphrase: The passphrase to store.
+    ///   - isHashed: Whether `passphrase` is already a SHA-256 hash. If
+    ///     `false`, it is hashed before being stored.
+    ///   - userID: The user identifier this passphrase is associated with, if
+    ///     known.
+    ///   - provider: The license provider this passphrase is associated with,
+    ///     if known.
+    public func addPassphrase(
+        _ passphrase: String,
+        isHashed: Bool,
+        userID: User.ID? = nil,
+        provider: LicenseDocument.Provider? = nil
+    ) async throws(LCPAddPassphraseError) {
+        try await passphrases.addPassphrase(
+            passphrase,
+            isHashed: isHashed,
+            userID: userID,
+            provider: provider
+        )
     }
 
     /// Acquires a protected publication from an LCPL.

@@ -14,7 +14,7 @@ import UIKit
 struct EPUBProgrammaticNavigationTests {
     @Test("same-resource fragment navigation reports whether the DOM target resolves")
     func sameResourceFragmentResolution() async {
-        let knownIDs: Set<String> = ["target"]
+        let knownIDs: Set = ["target"]
 
         let missing = await resolve(
             locator(fragments: ["missing"]),
@@ -65,7 +65,7 @@ struct EPUBProgrammaticNavigationTests {
             readingProgression: .ltr
         )
 
-        for _ in 0 ..< 1_000 where paginationView.currentView == nil {
+        for _ in 0 ..< 1000 where paginationView.currentView == nil {
             await Task.yield()
         }
         _ = try #require(paginationView.currentView)
@@ -81,7 +81,7 @@ struct EPUBProgrammaticNavigationTests {
             return resolved
         }
 
-        for _ in 0 ..< 1_000 where delegate.pages[2]?.hasPendingNavigation != true {
+        for _ in 0 ..< 1000 where delegate.pages[2]?.hasPendingNavigation != true {
             await Task.yield()
         }
         let destinationPage = try #require(delegate.pages[2])
@@ -119,7 +119,7 @@ struct EPUBProgrammaticNavigationTests {
             readingProgression: .ltr
         )
 
-        for _ in 0 ..< 1_000 where paginationView.currentView == nil {
+        for _ in 0 ..< 1000 where paginationView.currentView == nil {
             await Task.yield()
         }
         _ = try #require(paginationView.currentView)
@@ -132,7 +132,7 @@ struct EPUBProgrammaticNavigationTests {
             )
         }
 
-        for _ in 0 ..< 1_000 where delegate.pages[2]?.hasPendingNavigation != true {
+        for _ in 0 ..< 1000 where delegate.pages[2]?.hasPendingNavigation != true {
             await Task.yield()
         }
         let stalePage = try #require(delegate.pages[2])

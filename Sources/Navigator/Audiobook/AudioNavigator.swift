@@ -113,6 +113,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     public nonisolated let publication: Publication
     private let initialLocation: Locator?
     private let config: Configuration
+    private let audioSession: AudioSessionManaging
 
     public var audioConfiguration: AudioSession.Configuration {
         config.audioSession
@@ -121,11 +122,13 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     public init(
         publication: Publication,
         initialLocation: Locator? = nil,
-        config: Configuration = Configuration()
+        config: Configuration = Configuration(),
+        audioSession: AudioSessionManaging = AudioSession.shared
     ) {
         self.publication = publication
         self.initialLocation = initialLocation
         self.config = config
+        self.audioSession = audioSession
 
         let durations = publication.readingOrder.map { $0.duration ?? 0 }
         let totalDuration = durations.reduce(0, +)
@@ -143,9 +146,12 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         if let timeObserver = timeObserver {
             player.removeTimeObserver(timeObserver)
         }
+        if let playerItemEndObserver {
+            NotificationCenter.default.removeObserver(playerItemEndObserver)
+        }
 
         playTask?.cancel()
-        AudioSession.shared.end(for: self)
+        audioSession.end(for: self)
     }
 
     /// Returns whether the resource is currently playing or not.
@@ -199,7 +205,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     /// Resumes or start the playback.
     public func play() {
         playTask = Task { @MainActor in
-            AudioSession.shared.start(with: self, isPlaying: false)
+            audioSession.start(with: self, isPlaying: false)
 
             if player.currentItem == nil {
                 if let location = initialLocation {
@@ -248,6 +254,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     private var timeControlStatusObserver: NSKeyValueObservation?
     private var currentItemObserver: NSKeyValueObservation?
     private var timeObserver: Any?
+    private var playerItemEndObserver: Any?
 
     private lazy var mediaLoader = PublicationMediaLoader(publication: publication)
 
@@ -275,7 +282,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
                 return
             }
 
-            let session = AudioSession.shared
+            let session = self.audioSession
             switch player.timeControlStatus {
             case .paused:
                 session.user(self, didChangePlaying: false)
@@ -294,9 +301,9 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
             self?.playbackDidChange()
         }
 
-        NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] notification in
+        playerItemEndObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self, weak player] notification in
             guard
-                let self = self,
+                let self, let player,
                 let currentItem = player.currentItem,
                 currentItem == (notification.object as? AVPlayerItem)
             else {

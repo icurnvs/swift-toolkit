@@ -4,6 +4,80 @@ All notable changes to this project will be documented in this file. Take a look
 
 <!-- ## [Unreleased] -->
 
+## [3.11.1] - 2026-10-16
+
+### Changed
+
+#### LCP
+
+* Opening an LCP publication is no longer delayed by the CRL used to validate its license. The CRL is now downloaded when creating the `LCPService`, and an expired one is refreshed in the background instead of making the user wait for the response.
+
+### Fixed
+
+#### Navigator
+
+* Fixed reflowable EPUBs being displayed as a single column on the iPhone Duo unfolded in landscape, by porting the [responsive columns fix of Readium CSS 1.1.2](https://github.com/readium/css/issues/247).
+
+#### LCP
+
+* The CRL used to validate LCP licenses is now checked to be a genuine X.509 CRL before being cached. Networks with a captive portal (e.g. on a plane) could return their login page with a `200 OK` status, which was then cached for seven days and prevented opening LCP publications. An invalid CRL cached by a previous version is now ignored instead of waiting for its expiration.
+
+
+## [3.11.0] - 2026-07-17
+
+### Added
+
+#### Navigator
+
+* Added the `AudioSessionManaging` protocol, letting apps provide their own audio session manager instead of the built-in `AudioSession` (contributed by [@svenmeyers89](https://github.com/readium/swift-toolkit/pull/856)).
+
+#### LCP
+
+* `LCPService` has a new `addPassphrase(_:isHashed:userID:provider:)` method to store a passphrase candidate in the repository without opening a license first. Useful to preload a passphrase ahead of time (e.g. from a catalog).
+* `LCPClient` has a new `getSupportedLCPProfileURIs()` requirement, letting the toolkit report `LCPError.licenseProfileNotSupported` based on the profiles the embedded liblcp actually supports. Update your `LCPClient` facade to forward `R2LCPClient.getSupportedLCPProfileURIs()` (a default implementation is provided for backward compatibility).
+
+### Changed
+
+#### LCP
+
+* The auto-generated LCP device ID is now stored in the Keychain instead of `UserDefaults`, so it survives an app delete/reinstall and no longer needlessly consumes a license's device-registration slots. Existing IDs are automatically migrated from `UserDefaults`.
+
+### Fixed
+
+#### Shared
+
+* EPUB HREFs that are not percent-encoded but carry a fragment or query (e.g. `chapter one.xhtml#section`, with a space in the filename) now keep their `#fragment`/`?query` instead of encoding the separators into the path. This fixes table of contents and Media Overlays links failing to resolve and navigate in poorly-authored EPUBs.
+
+#### Navigator
+
+* Fixed custom `EditingAction`s sometimes missing from the text-selection menu for double-tap (single word) selections (contributed by [@raphi011](https://github.com/readium/swift-toolkit/pull/822)).
+* Fixed memory leak in the `AudioNavigator`.
+* [#802](https://github.com/readium/swift-toolkit/issues/802) Fixed fonts declared with `fontFamilyDeclarations` never loading in the EPUB navigator. Font fetches were CORS-gated by WebKit (contributed by [@atani](https://github.com/readium/swift-toolkit/pull/845)).
+
+
+## [3.10.0] - 2026-06-24
+
+### Changed
+
+#### LCP
+
+* `LCPPassphraseRepository.addPassphrase(_:userID:provider:)` no longer takes a license ID, and `provider` is now optional. A convenience `addPassphrase(_:)` overload is available for storing a passphrase without any associated user or provider.
+
+### Fixed
+
+#### Shared
+
+* ZIP entry names stored with a leading slash (e.g. `/001.jpg`, found in some CBZ comics) are now normalized to relative paths. Previously such entries resolved as absolute-path references against the base URL, causing them to fail.
+
+#### Navigator
+
+* Fixed EPUB footnotes never being detected when tapped, which prevented `EPUBNavigatorDelegate.navigator(_:shouldNavigateToNoteAt:content:referrer:)` from being called and made footnote references navigate to the note's location instead of being handled by the host (contributed by [@raphi011](https://github.com/readium/swift-toolkit/pull/821)).
+
+#### LCP
+
+* [#818](https://github.com/readium/swift-toolkit/issues/818) Repository failures during passphrase lookup (e.g. Keychain access errors) now fall through gracefully to the interactive authentication flow instead of propagating the error.
+
+
 ## [3.9.0] - 2026-05-12
 
 ### Added
@@ -1229,3 +1303,6 @@ progression. Now if no reading progression is set, the `effectiveReadingProgress
 [3.7.0]: https://github.com/readium/swift-toolkit/compare/3.6.0...3.7.0
 [3.8.0]: https://github.com/readium/swift-toolkit/compare/3.7.0...3.8.0
 [3.9.0]: https://github.com/readium/swift-toolkit/compare/3.8.0...3.9.0
+[3.10.0]: https://github.com/readium/swift-toolkit/compare/3.9.0...3.10.0
+[3.11.0]: https://github.com/readium/swift-toolkit/compare/3.10.0...3.11.0
+[3.11.1]: https://github.com/readium/swift-toolkit/compare/3.11.0...3.11.1
